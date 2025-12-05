@@ -23,6 +23,8 @@ from utils import cfg_to_dict, seed
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
+import copy
+import crafter
 
 ALL_MODEL_KEYS = [
     "encoder",
@@ -31,6 +33,18 @@ ALL_MODEL_KEYS = [
     "proprio_encoder",
     "action_encoder",
 ]
+
+def load_weight(model, path):
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+    state_dict = torch.load(path, weights_only=True)
+    for k, v in state_dict.items():
+        if 'module' in k:
+            name = k[7:] # remove `module.`
+            new_state_dict[name] = v
+        else:
+            break
+
 
 def planning_main_in_dir(working_dir, cfg_dict):
     os.chdir(working_dir)
@@ -151,10 +165,7 @@ class PlanWorkspace:
         #     transform=self.dset.transform,
         # )
 
-        if self.cfg_dict["goal_source"] == "file":
-            self.prepare_targets_from_file(cfg_dict["goal_file_path"])
-        else:
-            self.prepare_targets()
+        self.prepare_targets()
 
         self.evaluator = PlanEvaluator(
             obs_0=self.obs_0,
@@ -201,110 +212,29 @@ class PlanWorkspace:
         states = []
         actions = []
         observations = []
-        
-        if self.goal_source == "random_state":
-            # update env config from val trajs
-            observations, states, actions, env_info = (
-                self.sample_traj_segment_from_dset(traj_len=2)
-            )
-            self.env.update_env(env_info)
 
-            # sample random states
-            rand_init_state, rand_goal_state = self.env.sample_random_init_goal_states(
-                self.eval_seed
-            )
-            if self.env_name == "deformable_env": # take rand init state from dset for deformable envs
-                rand_init_state = np.array([x[0] for x in states])
-
-            obs_0, state_0 = self.env.prepare(self.eval_seed, rand_init_state)
-            obs_g, state_g = self.env.prepare(self.eval_seed, rand_goal_state)
-
-            # add dim for t
-            for k in obs_0.keys():
-                obs_0[k] = np.expand_dims(obs_0[k], axis=1)
-                obs_g[k] = np.expand_dims(obs_g[k], axis=1)
-
-            self.obs_0 = obs_0
-            self.obs_g = obs_g
-            self.state_0 = rand_init_state  # (b, d)
-            self.state_g = rand_goal_state
-            self.gt_actions = None
-        else:
-            # update env config from val trajs
-            observations, states, actions, env_info = (
-                self.sample_traj_segment_from_dset(traj_len=self.frameskip * self.goal_H + 1)
-            )
-            self.env.update_env(env_info)
-
-            # get states from val trajs
-            init_state = [x[0] for x in states]
-            init_state = np.array(init_state)
-            actions = torch.stack(actions)
-            if self.goal_source == "random_action":
-                actions = torch.randn_like(actions)
-            wm_actions = rearrange(actions, "b (t f) d -> b t (f d)", f=self.frameskip)
-            exec_actions = self.data_preprocessor.denormalize_actions(actions)
-            # replay actions in env to get gt obses
-            rollout_obses, rollout_states = self.env.rollout(
-                self.eval_seed, init_state, exec_actions.numpy()
-            )
-            self.obs_0 = {
-                key: np.expand_dims(arr[:, 0], axis=1)
-                for key, arr in rollout_obses.items()
-            }
-            self.obs_g = {
-                key: np.expand_dims(arr[:, -1], axis=1)
-                for key, arr in rollout_obses.items()
-            }
-            self.state_0 = init_state  # (b, d)
-            self.state_g = rollout_states[:, -1]  # (b, d)
-            self.gt_actions = wm_actions
-
-    def sample_traj_segment_from_dset(self, traj_len):
-        states = []
-        actions = []
-        observations = []
-        env_info = []
-
-        # Check if any trajectory is long enough
-        valid_traj = [
-            self.dset[i][0]["visual"].shape[0]
-            for i in range(len(self.dset))
-            if self.dset[i][0]["visual"].shape[0] >= traj_len
-        ]
-        if len(valid_traj) == 0:
-            raise ValueError("No trajectory in the dataset is long enough.")
-
-        # sample init_states from dset
-        for i in range(self.n_evals):
-            max_offset = -1
-            while max_offset < 0:  # filter out traj that are not long enough
-                traj_id = random.randint(0, len(self.dset) - 1)
-                obs, act, state, e_info = self.dset[traj_id]
-                max_offset = obs["visual"].shape[0] - traj_len
-            # state = state.numpy()
-            offset = random.randint(0, max_offset)
-            obs = {
-                key: arr[offset : offset + traj_len]
-                for key, arr in obs.items()
-            }
-            # state = state[offset : offset + traj_len]
-            act = act[offset : offset + self.frameskip * self.goal_H]
-            actions.append(act)
-            # states.append(state)
+        env_copy = copy.deepcopy(self.env)
+        obs = env_copy.reset()
+        for step in range(self.goal_H):
+            action = env_copy.action_space.sample()
+            obs, reward, done, info = env_copy.step(action)
             observations.append(obs)
-            env_info.append(e_info)
-        return observations, states, actions, env_info
+            actions.append(action)
+            if "state" in obs:
+                states.append(obs["state"])
+        self.obs_0 = {key: torch.tensor(np.array([observations[0][i][key] for i in range(self.n_evals)])).to(self.device) for key in observations[0]}
+        self.obs_g = {key: torch.tensor(np.array([observations[-1][i][key] for i in range(self.n_evals)])).to(self.device) for key in observations[-1]}
+        if "state" in observations[0]:
+            self.state_0 = torch.tensor(np.array([states[0][i] for i in range(self.n_evals)])).to(self.device)
+            self.state_g = torch.tensor(np.array([states[-1][i] for i in range(self.n_evals)])).to(self.device)
+        else:
+            self.state_0 = None
+            self.state_g = None
+        self.gt_actions = torch.tensor(np.array(actions)).permute(1,0,2).to(self.device)  # (n_evals, goal_H, action_dim)
 
-    def prepare_targets_from_file(self, file_path):
-        with open(file_path, "rb") as f:
-            data = pickle.load(f)
-        self.obs_0 = data["obs_0"]
-        self.obs_g = data["obs_g"]
-        self.state_0 = None #data["state_0"]
-        self.state_g = None #data["state_g"]
-        self.gt_actions = data["gt_actions"]
-        self.goal_H = data["goal_H"]
+
+        import pdb; pdb.set_trace()
+        
 
     def dump_targets(self):
         with open("plan_targets.pkl", "wb") as f:
@@ -359,7 +289,7 @@ def load_ckpt(snapshot_path, device):
         if k in ALL_MODEL_KEYS:
             loaded_keys.append(k)
             result[k] = v.to(device)
-    result["epoch"] = payload["epoch"]
+    # result["epoch"] = payload["epoch"]
     return result
 
 
@@ -367,7 +297,9 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
     result = {}
     if model_ckpt.exists():
         result = load_ckpt(model_ckpt, device)
-        print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
+        print(f"Resuming from epoch checkpoint: {model_ckpt}")
+    else:
+        raise ValueError(f"Model checkpoint not found at {model_ckpt}")
 
     # if "encoder" not in result:
     #     result["encoder"] = hydra.utils.instantiate(
@@ -452,35 +384,22 @@ def planning_main(cfg_dict):
     dset = dset["valid"]
 
     num_action_repeat = model_cfg.num_action_repeat
-    model_ckpt = (
-        Path(model_path) / "checkpoints" / f"model_{cfg_dict['model_epoch']}.pth"
-    )
+    
+    model_ckpt = (Path(model_path) / "weights"/ f"{cfg_dict['model_epoch']}.ckpt" / "nnet.pth")
+    action_encoder_ckpt = (Path(model_path) / "weights"/ f"{cfg_dict['model_epoch']}_encoder.pth")
+    
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
-
-    # use dummy vector env for wall and deformable envs
-    if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
-        from env.serial_vector_env import SerialVectorEnv
-        env = SerialVectorEnv(
-            [
-                gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
-                )
-                for _ in range(cfg_dict["n_evals"])
-            ]
-        )
-    else:
-        env = SubprocVectorEnv(
-            [
-                lambda: gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
-                )
-                for _ in range(cfg_dict["n_evals"])
-            ]
-        )
+    action_encoder = hydra.utils.call(model_cfg.action_encoder).to(device)
+    import pdb; pdb.set_trace()
+    action_encoder.load_state_dict(torch.load(action_encoder_ckpt, map_location=device))
+    import pdb; pdb.set_trace()
+    env = gym.make("CrafterReward-v1")
+    
 
     plan_workspace = PlanWorkspace(
         cfg_dict=cfg_dict,
         wm=model,
+        action_encoder=action_encoder,  
         dset=dset,
         env=env,
         env_name=model_cfg.env.name,
@@ -507,9 +426,9 @@ def main():
     # ============================================================================
     # MODEL CONFIGURATION
     # ============================================================================
-    ckpt_base_path = "/home/ripl-pc/Desktop/latent_action/baseline/dino_wm/checkpoints"#"./"  # Base path for checkpoints. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+    ckpt_base_path = "/home/teddy/Desktop/projects/baselines/dino_wm/checkpoints"#"./"  # Base path for checkpoints. Checkpoints will be loaded from ${ckpt_base_path}/outputs
     model_name = "crafter"  # Name of the model to load (must be set to a valid model name)
-    model_epoch = "latest"  # Model epoch to load: "latest", "final", or specific epoch number
+    model_epoch = "86500"  # Model epoch to load: "latest", "final", or specific epoch number
     
     saved_folder = Path(os.getcwd()) / "plan_outputs" / model_name
     saved_folder.mkdir(parents=True, exist_ok=True)
@@ -518,7 +437,7 @@ def main():
     # ============================================================================
     seed = 99  # Random seed
     n_evals = 10  # Number of evaluation runs
-    goal_source = "dset"  # Goal source: 'random_state', 'dset', 'random_action', or 'file'
+    goal_source = "random_action"  # Goal source: 'random_state', 'dset', 'random_action', or 'file'
     goal_H = 5  # Goal horizon - specifies how far away the goal is if goal_source is 'dset'
     n_plot_samples = 10  # Number of samples to plot
     debug_dset_init = False  # Whether to initialize with dataset actions (for debugging)

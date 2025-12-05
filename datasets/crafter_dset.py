@@ -50,7 +50,7 @@ class CrafterDataset(TrajDataset):
     def get_frames(self, idx, frames):
         file = self.all_files[idx]
         data = np.load(file)
-        action = data['action']
+        action = torch.from_numpy(data['action']).long()
         latent_action = data['latents']
         image = data['video'][frames]
         if image.dtype == np.uint8:
@@ -65,7 +65,7 @@ class CrafterDataset(TrajDataset):
         obs = {
             "visual": torch_image
         }
-        return obs, torch_latent_action, {}, {}
+        return obs, (torch_latent_action, action), {}, {}
     
     def get_seq_length(self, idx):
         return self.seq_lengths[idx]
