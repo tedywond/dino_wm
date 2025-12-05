@@ -369,42 +369,41 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
         result = load_ckpt(model_ckpt, device)
         print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
 
-    if "encoder" not in result:
-        result["encoder"] = hydra.utils.instantiate(
-            train_cfg.encoder,
-        )
-    if "predictor" not in result:
-        raise ValueError("Predictor not found in model checkpoint")
+    # if "encoder" not in result:
+    #     result["encoder"] = hydra.utils.instantiate(
+    #         train_cfg.encoder,
+    #     )
+    # if "predictor" not in result:
+    #     raise ValueError("Predictor not found in model checkpoint")
 
-    if train_cfg.has_decoder and "decoder" not in result:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        if train_cfg.env.decoder_path is not None:
-            decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
-            ckpt = torch.load(decoder_path)
-            if isinstance(ckpt, dict):
-                result["decoder"] = ckpt["decoder"]
-            else:
-                result["decoder"] = torch.load(decoder_path)
-        else:
-            raise ValueError(
-                "Decoder path not found in model checkpoint \
-                                and is not provided in config"
-            )
-    elif not train_cfg.has_decoder:
-        result["decoder"] = None
-
+    # if train_cfg.has_decoder and "decoder" not in result:
+    #     base_path = os.path.dirname(os.path.abspath(__file__))
+    #     if train_cfg.env.decoder_path is not None:
+    #         decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
+    #         ckpt = torch.load(decoder_path)
+    #         if isinstance(ckpt, dict):
+    #             result["decoder"] = ckpt["decoder"]
+    #         else:
+    #             result["decoder"] = torch.load(decoder_path)
+    #     else:
+    #         raise ValueError(
+    #             "Decoder path not found in model checkpoint \
+    #                             and is not provided in config"
+    #         )
+    # elif not train_cfg.has_decoder:
+    #     result["decoder"] = None
     model = hydra.utils.instantiate(
         train_cfg.model,
-        encoder=result["encoder"],
-        proprio_encoder=result["proprio_encoder"],
-        action_encoder=result["action_encoder"],
-        predictor=result["predictor"],
-        decoder=result["decoder"],
-        proprio_dim=train_cfg.proprio_emb_dim,
-        action_dim=train_cfg.action_emb_dim,
-        concat_dim=train_cfg.concat_dim,
-        num_action_repeat=num_action_repeat,
-        num_proprio_repeat=train_cfg.num_proprio_repeat,
+        img_size=train_cfg.dynamics_model.image_size,
+        patch_size=train_cfg.dynamics_model.patch_size, 
+        embed_dim=train_cfg.dynamics_model.embed_dim,
+        depth=train_cfg.dynamics_model.depth,
+        num_heads=train_cfg.dynamics_model.num_heads,
+        mlp_ratio=train_cfg.dynamics_model.mlp_ratio,
+        qkv_bias=train_cfg.dynamics_model.qkv_bias,
+        mlp_time_embed=train_cfg.dynamics_model.mlp_time_embed,
+        num_classes=train_cfg.dynamics_model.num_classes,
+        use_checkpoint=train_cfg.dynamics_model.use_checkpoint,
     )
     model.to(device)
     return model
@@ -439,7 +438,7 @@ def planning_main(cfg_dict):
         wandb_run = None
 
     ckpt_base_path = cfg_dict["ckpt_base_path"]
-    model_path = f"{ckpt_base_path}/outputs/{cfg_dict['model_name']}/"
+    model_path = f"{ckpt_base_path}/ours_ckpts/{cfg_dict['model_name']}/"
     with open(os.path.join(model_path, "hydra.yaml"), "r") as f:
         model_cfg = OmegaConf.load(f)
 
@@ -493,15 +492,157 @@ def planning_main(cfg_dict):
     return logs
 
 
-@hydra.main(config_path="conf", config_name="plan")
-def main(cfg: OmegaConf):
-    with open_dict(cfg):
-        cfg["saved_folder"] = os.getcwd()
-        log.info(f"Planning result saved dir: {cfg['saved_folder']}")
-    cfg_dict = cfg_to_dict(cfg)
-    cfg_dict["wandb_logging"] = False
+def main():
+    """
+    Standalone main method with all configurations hardcoded.
+    Modify the values below to change configuration without using config files.
+    """
+    
+    # ============================================================================
+    # BASIC CONFIGURATION
+    # ============================================================================
+     # Directory to save planning results
+    wandb_logging = False  # Whether to use wandb logging
+    
+    # ============================================================================
+    # MODEL CONFIGURATION
+    # ============================================================================
+    ckpt_base_path = "/home/ripl-pc/Desktop/latent_action/baseline/dino_wm/checkpoints"#"./"  # Base path for checkpoints. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+    model_name = "crafter"  # Name of the model to load (must be set to a valid model name)
+    model_epoch = "latest"  # Model epoch to load: "latest", "final", or specific epoch number
+    
+    saved_folder = Path(os.getcwd()) / "plan_outputs" / model_name
+    saved_folder.mkdir(parents=True, exist_ok=True)
+    # ============================================================================
+    # PLANNING CONFIGURATION
+    # ============================================================================
+    seed = 99  # Random seed
+    n_evals = 10  # Number of evaluation runs
+    goal_source = "dset"  # Goal source: 'random_state', 'dset', 'random_action', or 'file'
+    goal_H = 5  # Goal horizon - specifies how far away the goal is if goal_source is 'dset'
+    n_plot_samples = 10  # Number of samples to plot
+    debug_dset_init = False  # Whether to initialize with dataset actions (for debugging)
+    goal_file_path = None  # Path to goal file (only used if goal_source == 'file')
+    
+    # ============================================================================
+    # OBJECTIVE CONFIGURATION
+    # ============================================================================
+    objective = {
+        "_target_": "planning.objectives.create_objective_fn",
+        "alpha": 1,  # Weight for the objective function
+        "base": 2,  # Coefficient base for weighting all frames. Only applies when mode == 'all'
+        "mode": "last",  # Objective mode: 'last' or 'all'
+    }
+    
+    # ============================================================================
+    # PLANNER CONFIGURATION
+    # Choose one of the following planner configurations:
+    # ============================================================================
+    
+    # Option 1: Gradient Descent Planner (GD)
+    planner = {
+        "_target_": "planning.gd.GDPlanner",
+        "horizon": 5,  # Planning horizon (will be set to goal_H automatically)
+        "action_noise": 0.003,  # Action noise for exploration
+        "sample_type": "randn",  # Sample type: 'zero' or 'randn'
+        "lr": 1,  # Learning rate
+        "opt_steps": 1000,  # Optimization steps
+        "eval_every": 10,  # Evaluate every N steps
+        "name": "gd",
+    }
+    
+    # Option 2: Cross-Entropy Method Planner (CEM)
+    # Uncomment to use CEM planner instead:
+    # planner = {
+    #     "_target_": "planning.cem.CEMPlanner",
+    #     "horizon": 5,  # Planning horizon (will be set to goal_H automatically)
+    #     "topk": 30,  # Top K samples to keep
+    #     "num_samples": 300,  # Number of samples per iteration
+    #     "var_scale": 1,  # Variance scale
+    #     "opt_steps": 30,  # Optimization steps
+    #     "eval_every": 1,  # Evaluate every N steps
+    #     "name": "cem",
+    # }
+    
+    # Option 3: Model Predictive Control with GD (MPC-GD)
+    # Uncomment to use MPC-GD planner instead:
+    # planner = {
+    #     "_target_": "planning.mpc.MPCPlanner",
+    #     "max_iter": None,  # Maximum iterations (None for unlimited)
+    #     "n_taken_actions": 1,  # Number of actions to take before replanning
+    #     "sub_planner": {
+    #         "target": "planning.gd.GDPlanner",
+    #         "horizon": 5,
+    #         "action_noise": 0.003,
+    #         "sample_type": "randn",
+    #         "lr": 1,
+    #         "opt_steps": 1000,
+    #         "eval_every": 10,
+    #     },
+    #     "name": "mpc_gd",
+    # }
+    
+    # Option 4: Model Predictive Control with CEM (MPC-CEM)
+    # Uncomment to use MPC-CEM planner instead:
+    # planner = {
+    #     "_target_": "planning.mpc.MPCPlanner",
+    #     "max_iter": None,  # Maximum iterations (None for unlimited)
+    #     "n_taken_actions": 5,  # Number of actions to take before replanning
+    #     "sub_planner": {
+    #         "target": "planning.cem.CEMPlanner",
+    #         "horizon": 5,
+    #         "topk": 30,
+    #         "num_samples": 300,
+    #         "var_scale": 1,
+    #         "opt_steps": 30,
+    #         "eval_every": 1,
+    #     },
+    #     "name": "mpc_cem",
+    # }
+    
+    # ============================================================================
+    # BUILD CONFIGURATION DICTIONARY
+    # ============================================================================
+    cfg_dict = {
+        "saved_folder": saved_folder,
+        "wandb_logging": wandb_logging,
+        "ckpt_base_path": ckpt_base_path,
+        "model_name": model_name,
+        "model_epoch": model_epoch,
+        "seed": seed,
+        "n_evals": n_evals,
+        "goal_source": goal_source,
+        "goal_H": goal_H,
+        "n_plot_samples": n_plot_samples,
+        "debug_dset_init": debug_dset_init,
+        "objective": objective,
+        "planner": planner,
+    }
+    
+    # Add goal_file_path if goal_source is 'file'
+    if goal_source == "file":
+        if goal_file_path is None:
+            raise ValueError("goal_file_path must be set when goal_source is 'file'")
+        cfg_dict["goal_file_path"] = goal_file_path
+    
+    # Set planner horizon to match goal_H
+    if "sub_planner" in cfg_dict["planner"]:
+        # For MPC planners, set sub_planner horizon
+        cfg_dict["planner"]["sub_planner"]["horizon"] = goal_H
+        # Also set n_taken_actions to goal_H for MPC planners
+        if cfg_dict["planner"]["_target_"] == "planning.mpc.MPCPlanner":
+            cfg_dict["planner"]["n_taken_actions"] = goal_H
+    else:
+        # For direct planners, set horizon directly
+        cfg_dict["planner"]["horizon"] = goal_H
+    
+    # ============================================================================
+    # RUN PLANNING
+    # ============================================================================
+    log.info(f"Planning result saved dir: {cfg_dict['saved_folder']}")
     planning_main(cfg_dict)
 
 
 if __name__ == "__main__":
     main()
+
