@@ -141,15 +141,15 @@ class PlanWorkspace:
             cfg_dict["objective"],
         )
 
-        self.data_preprocessor = Preprocessor(
-            action_mean=self.dset.action_mean,
-            action_std=self.dset.action_std,
-            state_mean=self.dset.state_mean,
-            state_std=self.dset.state_std,
-            proprio_mean=self.dset.proprio_mean,
-            proprio_std=self.dset.proprio_std,
-            transform=self.dset.transform,
-        )
+        # self.data_preprocessor = Preprocessor(
+        #     action_mean=self.dset.action_mean,
+        #     action_std=self.dset.action_std,
+        #     state_mean=self.dset.state_mean,
+        #     state_std=self.dset.state_std,
+        #     proprio_mean=self.dset.proprio_mean,
+        #     proprio_std=self.dset.proprio_std,
+        #     transform=self.dset.transform,
+        # )
 
         if self.cfg_dict["goal_source"] == "file":
             self.prepare_targets_from_file(cfg_dict["goal_file_path"])
@@ -165,7 +165,7 @@ class PlanWorkspace:
             wm=self.wm,
             frameskip=self.frameskip,
             seed=self.eval_seed,
-            preprocessor=self.data_preprocessor,
+            preprocessor=None, #self.data_preprocessor,
             n_plot_samples=self.cfg_dict["n_plot_samples"],
         )
 
@@ -301,8 +301,8 @@ class PlanWorkspace:
             data = pickle.load(f)
         self.obs_0 = data["obs_0"]
         self.obs_g = data["obs_g"]
-        self.state_0 = data["state_0"]
-        self.state_g = data["state_g"]
+        self.state_0 = None #data["state_0"]
+        self.state_g = None #data["state_g"]
         self.gt_actions = data["gt_actions"]
         self.goal_H = data["goal_H"]
 
@@ -312,8 +312,8 @@ class PlanWorkspace:
                 {
                     "obs_0": self.obs_0,
                     "obs_g": self.obs_g,
-                    "state_0": self.state_0,
-                    "state_g": self.state_g,
+                    "state_0": None, #self.state_0,
+                    "state_g": None, #self.state_g,
                     "gt_actions": self.gt_actions,
                     "goal_H": self.goal_H,
                 },

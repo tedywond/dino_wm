@@ -58,10 +58,11 @@ class CrafterDataset(TrajDataset):
         else:
             image = image.astype(np.float32)
         image = rearrange(image, "T H W C -> T C H W")
+        torch_image = torch.from_numpy(image)
         if self.transform:
-            image = self.transform(image)
+            torch_image = self.transform(torch_image)
         obs = {
-            "visual": image
+            "visual": torch_image
         }
         return obs, latent_action, {}, {}
     
