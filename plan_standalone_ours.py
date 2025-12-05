@@ -282,16 +282,16 @@ class PlanWorkspace:
                 traj_id = random.randint(0, len(self.dset) - 1)
                 obs, act, state, e_info = self.dset[traj_id]
                 max_offset = obs["visual"].shape[0] - traj_len
-            state = state.numpy()
+            # state = state.numpy()
             offset = random.randint(0, max_offset)
             obs = {
                 key: arr[offset : offset + traj_len]
                 for key, arr in obs.items()
             }
-            state = state[offset : offset + traj_len]
+            # state = state[offset : offset + traj_len]
             act = act[offset : offset + self.frameskip * self.goal_H]
             actions.append(act)
-            states.append(state)
+            # states.append(state)
             observations.append(obs)
             env_info.append(e_info)
         return observations, states, actions, env_info

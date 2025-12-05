@@ -59,12 +59,13 @@ class CrafterDataset(TrajDataset):
             image = image.astype(np.float32)
         image = rearrange(image, "T H W C -> T C H W")
         torch_image = torch.from_numpy(image)
+        torch_latent_action = torch.from_numpy(latent_action)
         if self.transform:
             torch_image = self.transform(torch_image)
         obs = {
             "visual": torch_image
         }
-        return obs, latent_action, {}, {}
+        return obs, torch_latent_action, {}, {}
     
     def get_seq_length(self, idx):
         return self.seq_lengths[idx]
