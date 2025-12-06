@@ -19,7 +19,7 @@ class BasePlanner(ABC):
         self.action_dim = action_dim
         self.objective_fn = objective_fn
         self.preprocessor = preprocessor
-        self.device = next(wm.parameters()).device
+        self.device = next(wm.nnet.parameters()).device
 
         self.evaluator = evaluator
         self.wandb_run = wandb_run

@@ -17,9 +17,11 @@ from omegaconf import OmegaConf, open_dict
 
 from env.venv import SubprocVectorEnv
 from custom_resolvers import replace_slash
-from preprocessor import Preprocessor
+from preprocessor import Preprocessor, PreprocessorObsVisualOnly
 from planning.evaluator import PlanEvaluator
 from utils import cfg_to_dict, seed
+from helpers import load_latent_to_gt_actions
+from models.latWM import get_score_model
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -44,6 +46,7 @@ def load_weight(model, path):
             new_state_dict[name] = v
         else:
             break
+    model.load_state_dict(new_state_dict)
 
 
 def planning_main_in_dir(working_dir, cfg_dict):
@@ -127,6 +130,7 @@ class PlanWorkspace:
         self,
         cfg_dict: dict,
         wm: torch.nn.Module,
+        action_encoder: torch.nn.Module,
         dset,
         env: SubprocVectorEnv,
         env_name: str,
@@ -135,12 +139,13 @@ class PlanWorkspace:
     ):
         self.cfg_dict = cfg_dict
         self.wm = wm
+        self.action_encoder = action_encoder
         self.dset = dset
         self.env = env
         self.env_name = env_name
         self.frameskip = frameskip
         self.wandb_run = wandb_run
-        self.device = next(wm.parameters()).device
+        self.device = next(wm.nnet.parameters()).device
 
         # have different seeds for each planning instances
         self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
@@ -165,13 +170,14 @@ class PlanWorkspace:
         #     transform=self.dset.transform,
         # )
 
-        self.prepare_targets()
+        self.prepare_latent_to_gt_actions()
+        self.prepare_targets(self.action_encoder)
 
         self.evaluator = PlanEvaluator(
             obs_0=self.obs_0,
             obs_g=self.obs_g,
-            state_0=self.state_0,
-            state_g=self.state_g,
+            state_0=None,
+            state_g=None,
             env=self.env,
             wm=self.wm,
             frameskip=self.frameskip,
@@ -190,9 +196,9 @@ class PlanWorkspace:
             self.cfg_dict["planner"],
             wm=self.wm,
             env=self.env,  # only for mpc
-            action_dim=self.action_dim,
+            action_dim=self.dset.latent_action_dim,  #self.action_dim,
             objective_fn=objective_fn,
-            preprocessor=self.data_preprocessor,
+            preprocessor=PreprocessorObsVisualOnly(transform=self.dset.transform),
             evaluator=self.evaluator,
             wandb_run=self.wandb_run,
             log_filename=self.log_filename,
@@ -208,34 +214,59 @@ class PlanWorkspace:
 
         self.dump_targets()
 
-    def prepare_targets(self):
+    def prepare_latent_to_gt_actions(self):
+        self.gt_latent_actions, self.gt_actions = load_latent_to_gt_actions(self.dset.data_path)
+        from sklearn.cluster import KMeans
+        self.kmeans = KMeans(n_clusters=50, random_state=0, n_init='auto')
+        self.kmeans.fit(self.gt_latent_actions.cpu().numpy())
+        cluster_centers = self.kmeans.cluster_centers_
+        labels = self.kmeans.labels_
+
+        cluster_voted_actions = []
+
+        for cluster_idx in range(len(cluster_centers)):
+            cluster_actions = self.gt_actions.cpu().numpy()[labels == cluster_idx]
+            if len(cluster_actions) == 0:
+                voted_action = -1  # or some default value
+            else:
+                voted_action = np.bincount(cluster_actions).argmax().item()
+            cluster_voted_actions.append(voted_action)
+        self.cluster_voted_actions = np.array(cluster_voted_actions)
+
+    def prepare_targets(self, latent_action_encoder):
         states = []
         actions = []
         observations = []
 
         env_copy = copy.deepcopy(self.env)
         obs = env_copy.reset()
+        observations.append(obs)
         for step in range(self.goal_H):
-            action = env_copy.action_space.sample()
+            action = np.random.randint(0, 7)
             obs, reward, done, info = env_copy.step(action)
             observations.append(obs)
             actions.append(action)
-            if "state" in obs:
-                states.append(obs["state"])
-        self.obs_0 = {key: torch.tensor(np.array([observations[0][i][key] for i in range(self.n_evals)])).to(self.device) for key in observations[0]}
-        self.obs_g = {key: torch.tensor(np.array([observations[-1][i][key] for i in range(self.n_evals)])).to(self.device) for key in observations[-1]}
-        if "state" in observations[0]:
-            self.state_0 = torch.tensor(np.array([states[0][i] for i in range(self.n_evals)])).to(self.device)
-            self.state_g = torch.tensor(np.array([states[-1][i] for i in range(self.n_evals)])).to(self.device)
-        else:
-            self.state_0 = None
-            self.state_g = None
-        self.gt_actions = torch.tensor(np.array(actions)).permute(1,0,2).to(self.device)  # (n_evals, goal_H, action_dim)
 
+        self.obs_0 = observations[0]
+        self.obs_g = observations[-1]
+        self.sequence_actions = actions
 
-        import pdb; pdb.set_trace()
+        stacked_observations = torch.from_numpy(np.stack(observations))
+        stacked_observations = self.dset.transform(stacked_observations.permute(0, 3, 1, 2)/255.0).to(self.device)
+        time_indices = torch.arange(self.frameskip + 1).to(self.device).unsqueeze(0)
+        transition_pairs = torch.stack([stacked_observations[:-1], stacked_observations[1:]], dim=1)
         
+        with torch.no_grad():
+            self.sequence_latent_actions, _ = latent_action_encoder(transition_pairs, time_indices.repeat(transition_pairs.size(0), 1), mask_ratio=0.0)
+        import pdb; pdb.set_trace()
+        kmeans_pred = [self.kmeans.predict(self.sequence_latent_actions.cpu().numpy()[i]).item() for i in range(self.sequence_latent_actions.size(0))]
+        kmeans_model_estimated_action = self.cluster_voted_actions[kmeans_pred]
+        
+        closest_latact = np.argmin(np.linalg.norm(self.gt_latent_actions.cpu() - self.sequence_latent_actions.cpu(), axis=-1), axis=1)
+        closest_estimated_action = self.gt_actions[closest_latact]
 
+        self.estimated_actions = (kmeans_model_estimated_action, closest_estimated_action)
+        
     def dump_targets(self):
         with open("plan_targets.pkl", "wb") as f:
             pickle.dump(
@@ -301,29 +332,6 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
     else:
         raise ValueError(f"Model checkpoint not found at {model_ckpt}")
 
-    # if "encoder" not in result:
-    #     result["encoder"] = hydra.utils.instantiate(
-    #         train_cfg.encoder,
-    #     )
-    # if "predictor" not in result:
-    #     raise ValueError("Predictor not found in model checkpoint")
-
-    # if train_cfg.has_decoder and "decoder" not in result:
-    #     base_path = os.path.dirname(os.path.abspath(__file__))
-    #     if train_cfg.env.decoder_path is not None:
-    #         decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
-    #         ckpt = torch.load(decoder_path)
-    #         if isinstance(ckpt, dict):
-    #             result["decoder"] = ckpt["decoder"]
-    #         else:
-    #             result["decoder"] = torch.load(decoder_path)
-    #     else:
-    #         raise ValueError(
-    #             "Decoder path not found in model checkpoint \
-    #                             and is not provided in config"
-    #         )
-    # elif not train_cfg.has_decoder:
-    #     result["decoder"] = None
     model = hydra.utils.instantiate(
         train_cfg.model,
         img_size=train_cfg.dynamics_model.image_size,
@@ -389,17 +397,15 @@ def planning_main(cfg_dict):
     action_encoder_ckpt = (Path(model_path) / "weights"/ f"{cfg_dict['model_epoch']}_encoder.pth")
     
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
-    action_encoder = hydra.utils.call(model_cfg.action_encoder).to(device)
-    import pdb; pdb.set_trace()
-    action_encoder.load_state_dict(torch.load(action_encoder_ckpt, map_location=device))
-    import pdb; pdb.set_trace()
+    latent_action_encoder = hydra.utils.call(model_cfg.action_encoder).to(device)
+    load_weight(latent_action_encoder, action_encoder_ckpt)
+    score_model = get_score_model(model)
     env = gym.make("CrafterReward-v1")
     
-
     plan_workspace = PlanWorkspace(
         cfg_dict=cfg_dict,
-        wm=model,
-        action_encoder=action_encoder,  
+        wm=score_model,
+        action_encoder=latent_action_encoder,  
         dset=dset,
         env=env,
         env_name=model_cfg.env.name,
@@ -426,7 +432,7 @@ def main():
     # ============================================================================
     # MODEL CONFIGURATION
     # ============================================================================
-    ckpt_base_path = "/home/teddy/Desktop/projects/baselines/dino_wm/checkpoints"#"./"  # Base path for checkpoints. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+    ckpt_base_path = "/home/ripl-pc/Desktop/latent_action/baseline/dino_wm/checkpoints"#"./"  # Base path for checkpoints. Checkpoints will be loaded from ${ckpt_base_path}/outputs
     model_name = "crafter"  # Name of the model to load (must be set to a valid model name)
     model_epoch = "86500"  # Model epoch to load: "latest", "final", or specific epoch number
     
@@ -435,7 +441,7 @@ def main():
     # ============================================================================
     # PLANNING CONFIGURATION
     # ============================================================================
-    seed = 99  # Random seed
+    seed = 3  # Random seed
     n_evals = 10  # Number of evaluation runs
     goal_source = "random_action"  # Goal source: 'random_state', 'dset', 'random_action', or 'file'
     goal_H = 5  # Goal horizon - specifies how far away the goal is if goal_source is 'dset'

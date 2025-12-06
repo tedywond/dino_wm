@@ -60,3 +60,19 @@ class Preprocessor:
         transformed_obs['visual'] = self.transform_obs_visual(obs['visual'])
         transformed_obs['proprio'] = self.normalize_proprios(torch.tensor(obs['proprio']))
         return transformed_obs
+
+
+class PreprocessorObsVisualOnly:
+    def __init__(self, transform):
+        self.transform = transform
+
+    def preprocess_obs_visual(self, obs_visual):
+        return rearrange(obs_visual, "b t h w c -> b t c h w") / 255.0
+
+    def transform_obs(self, obs_visual):
+        transformed_obs_visual = torch.tensor(obs_visual)
+        if obs_visual.ndim == 3:
+            transformed_obs_visual = transformed_obs_visual.unsqueeze(0).unsqueeze(0)
+        transformed_obs_visual = self.preprocess_obs_visual(transformed_obs_visual)
+        transformed_obs_visual = self.transform(transformed_obs_visual)
+        return transformed_obs_visual

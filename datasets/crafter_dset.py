@@ -40,9 +40,8 @@ class CrafterDataset(TrajDataset):
         actions = torch.from_numpy(np.concatenate(action_data)).long()  # discrete actions therefore no need to scale
         latent_actions = torch.from_numpy(np.concatenate(latent_action_data)).float()
         print(f"Loaded {len(self.all_files)} rollouts")
-
-        self.action_dim = actions.shape[-1]
-        self.latent_action_dim = latent_actions.shape[-1]
+        self.action_dim = 1
+        self.latent_action_dim = 32
 
     def get_all_actions(self):
         return self.actions
@@ -80,7 +79,7 @@ class CrafterDataset(TrajDataset):
 
 def load_crafter_slice_train_val(
     transform,
-    n_rollout=50,
+    n_rollout=1,
     data_path='data/crafter',
     normalize_action=False,
     split_ratio=0.8,

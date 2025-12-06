@@ -3,6 +3,8 @@ import numpy as np
 from einops import rearrange
 from .base_planner import BasePlanner
 from utils import move_to_device
+from models.latWM import sde
+from models.latWM import transform, invTrans
 
 
 class GDPlanner(BasePlanner):
@@ -40,12 +42,13 @@ class GDPlanner(BasePlanner):
         self.opt_steps = opt_steps
         self.eval_every = eval_every
         self.logging_prefix = logging_prefix
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def init_actions(self, obs_0, actions=None):
         """
         Initializes or appends actions for planning, ensuring the output shape is (b, self.horizon, action_dim).
         """
-        n_evals = obs_0["visual"].shape[0]
+        n_evals = obs_0.shape[0]
         if actions is None:
             actions = torch.zeros(n_evals, 0, self.action_dim)
         device = actions.device
@@ -63,6 +66,7 @@ class GDPlanner(BasePlanner):
                 new_actions = self.preprocessor.normalize_actions(new_actions)
                 new_actions = rearrange(new_actions, "... f d -> ... (f d)")
             actions = torch.cat([actions, new_actions.to(device)], dim=1)
+
         return actions
 
     def get_action_optimizer(self, actions):
@@ -75,27 +79,31 @@ class GDPlanner(BasePlanner):
         Returns:
             actions: (B, T, action_dim) torch.Tensor
         """
-        trans_obs_0 = move_to_device(
-            self.preprocessor.transform_obs(obs_0), self.device
-        )
-        trans_obs_g = move_to_device(
-            self.preprocessor.transform_obs(obs_g), self.device
-        )
-        z_obs_g = self.wm.encode_obs(trans_obs_g)
-        z_obs_g_detached = {key: value.detach() for key, value in z_obs_g.items()}
+        trans_obs_0 = self.preprocessor.transform_obs(obs_0).to(self.device)
+        trans_obs_g = self.preprocessor.transform_obs(obs_g).to(self.device)
 
-        actions = self.init_actions(obs_0, actions).to(self.device)
+        actions = self.init_actions(trans_obs_0, actions).to(self.device)
         actions.requires_grad = True
         optimizer = self.get_action_optimizer(actions)
         n_evals = actions.shape[0]
+        estimated_observations = []
 
         for i in range(self.opt_steps):
             optimizer.zero_grad()
-            i_z_obses, i_zs = self.wm.rollout(
-                obs_0=trans_obs_0,
-                act=actions,
-            )
-            loss = self.objective_fn(i_z_obses, z_obs_g_detached)  # (n_evals, )
+            
+            import pdb; pdb.set_trace()
+            query_frame = trans_obs_0.squeeze(0)
+            with torch.no_grad():
+                for i in range(self.horizon):
+                    x_init = torch.randn(*trans_obs_0.shape, device=self.device)
+                    sample = sde.euler_maruyama(sde.ODE(self.wm), x_init=x_init, sample_steps=50, y=None, condition=actions[:,1:], img_cond=query_frame, target_time_index=torch.zeros([1, 1], device=self.device), alpha=0, adversarial=False)
+                    transformed_sample = torch.clip(invTrans(sample.squeeze(0)), 0, 1)
+                    estimated_observations.append(transformed_sample.permute(0, 2, 3, 1).detach().cpu().numpy())
+                    query_frame = transform(transformed_sample)
+
+
+            import pdb; pdb.set_trace()            
+            loss = self.objective_fn(i_z_obses, trans_obs_g)  # (n_evals, )
             total_loss = loss.mean() * n_evals  # loss for each eval is independent
             total_loss.backward()
             with torch.no_grad():

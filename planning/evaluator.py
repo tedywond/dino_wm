@@ -38,7 +38,7 @@ class PlanEvaluator:  # evaluator for planning
         self.seed = seed
         self.preprocessor = preprocessor
         self.n_plot_samples = n_plot_samples
-        self.device = next(wm.parameters()).device
+        self.device = next(wm.nnet.parameters()).device
 
         self.plot_full = False  # plot all frames or frames after frameskip
 
